@@ -1,0 +1,20 @@
+# Regenerable bulk data. All of this is rebuilt by the pipeline in Scripts/
+# and is far too large for git (2.2 GB in total).
+#
+#   DEM/       12 COP30 tiles + the 30 m mosaic, downloaded by 01_dem_prep.py
+#              and 10_dem30.py from the public copernicus-dem-30m AWS bucket
+#   Viewshed/  line-of-sight rasters, rebuilt by 11_visibility30.py in ~172 s
+#   Solar/     sunrise alignment and shadow rasters, from 04_solar.py
+#   OSM/       Overpass extracts, refetched by 03_osm.py
+#
+# Kept in the repo: Scripts/, Results/, Web/, the QGIS project, the A2 print
+# sheet, brand.json and this README.
+
+DEM/
+Viewshed/
+Solar/
+OSM/
+
+# QGIS scratch
+*.qgz~
+*.qgd

@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sri Pada Visibility Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  :root{
+    --bg:#0f1720; --panel:#18232e; --line:#2c3c4c; --ink:#e8eef4;
+    --muted:#9fb0c0; --accent:#f0a03c;
+  }
+  html,body{margin:0;height:100%;font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif;
+            background:var(--bg);color:var(--ink)}
+  #map{position:absolute;inset:0}
+  .pane{position:absolute;z-index:1000;background:rgba(24,35,46,.95);
+        border:1px solid var(--line);border-radius:10px;
+        box-shadow:0 6px 24px rgba(0,0,0,.45)}
+  #ctl{top:12px;right:12px;width:265px;padding:12px 14px;max-height:calc(100% - 24px);
+       overflow:auto}
+  #ctl h1{margin:0 0 2px;font-size:15px;letter-spacing:.02em}
+  #ctl .sub{color:var(--muted);font-size:11.5px;margin-bottom:10px}
+  #ctl h2{font-size:11px;text-transform:uppercase;letter-spacing:.09em;
+          color:var(--muted);margin:14px 0 6px;font-weight:600}
+  label.row{display:flex;align-items:center;gap:8px;padding:3px 0;cursor:pointer}
+  label.row input{accent-color:var(--accent);margin:0}
+  .sw{width:14px;height:14px;border-radius:3px;border:1px solid rgba(255,255,255,.25);
+      flex:0 0 auto}
+  .leg{display:flex;align-items:center;gap:7px;padding:2px 0;font-size:12px}
+  #rd{bottom:12px;left:12px;width:290px;padding:12px 14px}
+  #rd .t{font-size:11px;text-transform:uppercase;letter-spacing:.09em;
+         color:var(--muted);margin-bottom:6px}
+  #rd table{width:100%;border-collapse:collapse;font-size:12.5px}
+  #rd td{padding:2px 0;vertical-align:top}
+  #rd td.k{color:var(--muted);white-space:nowrap;padding-right:8px}
+  #rd td.v{text-align:right;font-variant-numeric:tabular-nums}
+  .yes{color:#8ddf8d}.no{color:#ef8a7a}
+  .hint{color:var(--muted);font-size:12px}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .leaflet-popup-content{font:13px system-ui;margin:10px 12px}
+  .cred{font-size:10.5px;color:var(--muted);margin-top:12px;border-top:1px solid var(--line);
+        padding-top:8px;line-height:1.4}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="pane" id="ctl">
+  <h1>Sri Pada visibility</h1>
+  <div class="sub">Adam&rsquo;s Peak, 2192 m &middot; Copernicus GLO-30 &middot; EPSG:5235</div>
+
+  <h2>Layers</h2>
+  <div id="layers"></div>
+
+  <h2>Overlay opacity</h2>
+  <input type="range" id="op" min="0" max="100" value="82">
+
+  <h2>Legend</h2>
+  <div id="legend"></div>
+
+  <div class="cred">
+    Line of sight with earth curvature and refraction (k&nbsp;=&nbsp;0.13).
+    Surface is a DSM, so canopy blocks and lifts alike. Click the map for a
+    full readout.
+  </div>
+</div>
+
+<div class="pane" id="rd">
+  <div class="t">Readout</div>
+  <div id="rdbody" class="hint">Click anywhere on the map.</div>
+</div>
+
+<script>
+const D = /*__DATA__*/;
+const K = 0.13, R = 6371008.8, EYE = 1.7, OBL = 23.44;
+
+/* ---------- decode the embedded Int16 query grids ---------- */
+function grid(g){
+  const bin = atob(g.b64), u = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+  g.a = new Int16Array(u.buffer);
+  g.get = function(lat,lon){
+    const c = Math.floor((lon-this.x0)/this.dx),
+          r = Math.floor((lat-this.y0)/this.dy);
+    if(c<0||c>=this.w||r<0||r>=this.h) return null;
+    const v = this.a[r*this.w+c];
+    return v<=-9000 ? null : v;
+  };
+  return g;
+}
+const QH = grid(D.qh), QZ = grid(D.qz);
+
+/* ---------- geometry ---------- */
+const rad = d=>d*Math.PI/180, deg = r=>r*180/Math.PI;
+function geo(lat1,lon1,lat2,lon2){
+  const p1=rad(lat1),p2=rad(lat2),dp=rad(lat2-lat1),dl=rad(lon2-lon1);
+  const a=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(a)));
+}
+function bearing(lat1,lon1,lat2,lon2){
+  const p1=rad(lat1),p2=rad(lat2),dl=rad(lon2-lon1);
+  const y=Math.sin(dl)*Math.cos(p2);
+  const x=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
+  return (deg(Math.atan2(y,x))+360)%360;
+}
+const drop = d => (1-K)*d*d/(2*R);
+const refr = a => (1.02/Math.tan(rad(Math.max(a,-0.5)+10.3/(Math.max(a,-0.5)+5.11))))/60;
+
+/* invert the declination table -> the two dates of the year */
+function alignDates(lat, A, theta){
+  if(!(A>0 && A<180)) return null;
+  const h = theta - refr(theta), ph = rad(lat), hr = rad(h);
+  const s = Math.sin(ph)*Math.sin(hr) + Math.cos(ph)*Math.cos(hr)*Math.cos(rad(A));
+  if(Math.abs(s)>1) return null;
+  const dec = deg(Math.asin(s));
+  if(Math.abs(dec)>OBL) return null;
+  const T=D.dec; let imax=0,imin=0;
+  for(let i=0;i<T.length;i++){ if(T[i]>T[imax])imax=i; if(T[i]<T[imin])imin=i; }
+  function scan(lo,hi,rising){
+    for(let i=lo;i<hi;i++){
+      const a=T[i],b=T[i+1];
+      if((rising && dec>=a && dec<=b)||(!rising && dec<=a && dec>=b)){
+        const f=(dec-a)/((b-a)||1e-9);
+        return i+1+f;
+      }
+    }
+    return null;
+  }
+  const d1=scan(0,imax,true), d2=scan(imax,imin,false);
+  return [d1,d2].map(x=>x===null?null:doyStr(x));
+}
+function doyStr(doy){
+  const d=new Date(Date.UTC(2026,0,1)); d.setUTCDate(d.getUTCDate()+Math.round(doy)-1);
+  return d.toLocaleDateString('en-GB',{day:'numeric',month:'short',timeZone:'UTC'});
+}
+
+/* ---------- map ---------- */
+const map = L.map('map',{center:[7.3,80.6],zoom:8,zoomControl:true});
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom:18,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+
+const LDEF = [
+  ['height_needed','Observer height needed',true],
+  ['grade','How strongly it reads',false],
+  ['align','Date the sun rises behind the peak',false],
+];
+Object.keys(D.layers).filter(k=>k.startsWith('shadow_'))
+  .forEach(k=>LDEF.push([k,'Shadow of the peak, '+k.slice(7,11)+'-'+k.slice(11,13)+'-'+k.slice(13,15),false]));
+
+const OV = {};
+LDEF.forEach(([k,label,on])=>{
+  const L0 = D.layers[k]; if(!L0) return;
+  OV[k] = L.imageOverlay('data:image/png;base64,'+L0.b64, L0.bounds,
+                         {opacity:0.82, interactive:false});
+  if(on) OV[k].addTo(map);
+});
+
+const box = document.getElementById('layers');
+LDEF.forEach(([k,label,on])=>{
+  if(!OV[k]) return;
+  const id='c_'+k;
+  box.insertAdjacentHTML('beforeend',
+    `<label class="row"><input type="checkbox" id="${id}" ${on?'checked':''}>
+     <span>${label}</span></label>`);
+  document.getElementById(id).addEventListener('change',e=>{
+    e.target.checked ? OV[k].addTo(map) : map.removeLayer(OV[k]);
+    drawLegend();
+  });
+});
+document.getElementById('op').addEventListener('input',e=>{
+  const v=e.target.value/100; Object.values(OV).forEach(l=>l.setOpacity(v));
+});
+
+/* ---------- legend ---------- */
+const LEGENDS = {
+  height_needed:[['#ffffb2','Visible standing on the ground'],
+    ['#fed976','Needs 10 m &middot; 3 storeys'],['#feb24c','Needs 30 m &middot; 10 storeys'],
+    ['#fd8d3c','Needs 60 m &middot; 20 storeys'],['#f03b20','Needs 100 m &middot; 33 storeys'],
+    ['#bd0026','Needs 150 m &middot; 50 storeys'],['transparent','Never, at any height']],
+  grade:[['#08306b','Prominent, &ge;2&deg;'],['#2171b5','Clear, 1&ndash;2&deg;'],
+    ['#4292c6','Distinct, 0.5&ndash;1&deg;'],['#9ecae1','Faint, 0.2&ndash;0.5&deg;'],
+    ['#deebf7','Marginal, &lt;0.2&deg;']],
+  align:[['#4575b4','January'],['#91bfdb','March'],['#fee090','June'],
+    ['#fc8d59','September'],['#d73027','December']],
+};
+function drawLegend(){
+  const el=document.getElementById('legend'); el.innerHTML='';
+  LDEF.forEach(([k])=>{
+    if(!OV[k]||!map.hasLayer(OV[k])) return;
+    if(k.startsWith('shadow_')){
+      el.insertAdjacentHTML('beforeend',
+        `<div class="leg"><span class="sw" style="background:#fdae6b"></span>
+         shadow of the summit cone</div>
+         <div class="leg"><span class="sw" style="background:#54278f"></span>
+         other terrain shadow</div>`);
+      return;
+    }
+    (LEGENDS[k]||[]).forEach(([c,t])=>{
+      el.insertAdjacentHTML('beforeend',
+        `<div class="leg"><span class="sw" style="background:${c}"></span>${t}</div>`);
+    });
+  });
+  if(!el.innerHTML) el.innerHTML='<span class="hint">No overlay shown.</span>';
+}
+drawLegend();
+
+/* ---------- summit + places ---------- */
+const S = D.summit;
+L.marker([S.lat,S.lon]).addTo(map)
+ .bindPopup('<b>Sri Pada / Adam&rsquo;s Peak</b><br>DEM 2192 m &middot; surveyed 2243 m');
+
+const pg = L.layerGroup();
+D.places.forEach(p=>{
+  const vis = p.v==='ground level';
+  L.circleMarker([p.la,p.lo],{radius:vis?4:3,weight:1,color:'#12202c',
+    fillColor:vis?'#ffd166':'#7a8b9c',fillOpacity:.95})
+   .bindPopup(`<b>${p.n||'(unnamed)'}</b><br>${p.d} km from the summit<br>
+     ${vis?'Visible from the ground':'Needs '+p.h+' m of height'}
+     ${p.a?'<br>Apparent height '+p.a+'&deg;':''}
+     ${p.s1?'<br>Sun rises behind it: '+p.s1+' &amp; '+p.s2:''}`)
+   .addTo(pg);
+});
+pg.addTo(map);
+box.insertAdjacentHTML('beforeend',
+  `<label class="row"><input type="checkbox" id="c_pl" checked>
+   <span>Towns and villages</span></label>`);
+document.getElementById('c_pl').addEventListener('change',
+  e=>e.target.checked?pg.addTo(map):map.removeLayer(pg));
+
+/* ---------- click readout ---------- */
+let mk=null;
+map.on('click',e=>{
+  const lat=e.latlng.lat, lon=e.latlng.lng;
+  const d=geo(lat,lon,S.lat,S.lon);
+  const A=bearing(lat,lon,S.lat,S.lon);
+  const h=QH.get(lat,lon), z=QZ.get(lat,lon);
+  const rows=[];
+  const f=(k,v)=>rows.push(`<tr><td class="k">${k}</td><td class="v">${v}</td></tr>`);
+  f('Distance', (d/1000).toFixed(1)+' km');
+  f('Look toward', A.toFixed(1)+'&deg;');
+  f('Ground here', z===null?'&ndash;':z+' m');
+  f('Curvature drop', (drop(d)).toFixed(0)+' m');
+  if(h===null){
+    f('Line of sight','outside grid');
+  }else{
+    const vis = h<=EYE;
+    f('From the ground', vis?'<span class="yes">visible</span>'
+                            :'<span class="no">blocked</span>');
+    if(!vis) f('Height needed', h>300?'&gt;300 m':h+' m');
+    else f('Headroom', (-h).toFixed(0)+' m');
+    const obs = (z===null?0:z) + (vis?EYE:Math.max(h,0));
+    const th = deg(Math.atan2(S.z-drop(d)-obs, Math.max(d,1)));
+    if(th>0){
+      f('Apparent height', th.toFixed(2)+'&deg;');
+      const al = alignDates(lat,A,th);
+      if(al&&al[0]&&al[1]) f('Sun rises behind it', al[0]+' &amp; '+al[1]);
+      else f('Sun rises behind it','never &ndash; wrong bearing');
+    }
+  }
+  document.getElementById('rdbody').innerHTML=`<table>${rows.join('')}</table>`;
+  if(mk) map.removeLayer(mk);
+  mk=L.circleMarker([lat,lon],{radius:6,color:'#f0a03c',weight:2,
+      fillColor:'#f0a03c',fillOpacity:.35}).addTo(map);
+});
+</script>
+</body>
+</html>
